@@ -55,71 +55,78 @@ def build_service(user_credentials: Dict) -> 'Resource':
         logger.error("Failed to build Drive service", error=str(e))
         raise DriveClientError(f"Failed to build Drive service: {str(e)}")
 
-def list_files(service: 'Resource', page_size: int = 1000) -> List[Dict]:
+def list_files(service: 'Resource', page_size: int = 1000, page_token: Optional[str] = None, mime_type: Optional[str] = None, max_results: Optional[int] = None) -> Dict:
     """
-    List all files in Google Drive with pagination and retry logic.
+    List files in Google Drive with pagination and retry logic.
     
     Args:
         service: Google Drive service resource
         page_size: Number of files to fetch per request
+        page_token: Token for pagination
+        mime_type: Filter by MIME type (e.g., 'application/vnd.google-apps.folder' for folders)
+        max_results: Maximum number of results to return
         
     Returns:
-        List of file metadata dictionaries
+        Dictionary with 'files' list and 'nextPageToken' if available
         
     Raises:
         DriveClientError: If API calls fail after retries
     """
-    files = []
-    page_token = None
     max_retries = 3
     base_delay = 1
     
     try:
-        while True:
-            retry_count = 0
-            while retry_count < max_retries:
-                try:
-                    # Call the Drive v3 API
-                    results = service.files().list(
-                        pageSize=page_size,
-                        fields="nextPageToken, files(id, name, mimeType, parents, createdTime, modifiedTime, size, webViewLink)",
-                        pageToken=page_token
-                    ).execute()
-                    
-                    items = results.get('files', [])
-                    files.extend(items)
-                    
-                    page_token = results.get('nextPageToken', None)
-                    if page_token is None:
-                        break
-                        
-                    break  # Success, exit retry loop
-                    
-                except HttpError as error:
-                    retry_count += 1
-                    if error.resp.status in [403, 429]:  # Rate limit or quota exceeded
-                        if retry_count < max_retries:
-                            delay = base_delay * (2 ** (retry_count - 1))  # Exponential backoff
-                            logger.warning(f"Rate limited, retrying in {delay}s", retry_count=retry_count)
-                            time.sleep(delay)
-                            continue
-                        else:
-                            logger.error("Max retries exceeded for rate limit", error=str(error))
-                            raise DriveClientError(f"Rate limit exceeded after {max_retries} retries")
+        retry_count = 0
+        while retry_count < max_retries:
+            try:
+                # Build query parameters
+                query_params = {
+                    'pageSize': page_size,
+                    'fields': "nextPageToken, files(id, name, mimeType, parents, createdTime, modifiedTime, size, webViewLink)"
+                }
+                
+                if page_token:
+                    query_params['pageToken'] = page_token
+                
+                if mime_type:
+                    query_params['q'] = f"mimeType='{mime_type}'"
+                
+                # Call the Drive v3 API
+                results = service.files().list(**query_params).execute()
+                
+                items = results.get('files', [])
+                
+                # Apply max_results limit if specified
+                if max_results and len(items) > max_results:
+                    items = items[:max_results]
+                    # Remove nextPageToken if we're limiting results
+                    results.pop('nextPageToken', None)
+                
+                logger.info("Successfully listed files", count=len(items))
+                return results
+                
+            except HttpError as error:
+                retry_count += 1
+                if error.resp.status in [403, 429]:  # Rate limit or quota exceeded
+                    if retry_count < max_retries:
+                        delay = base_delay * (2 ** (retry_count - 1))  # Exponential backoff
+                        logger.warning(f"Rate limited, retrying in {delay}s", retry_count=retry_count)
+                        time.sleep(delay)
+                        continue
                     else:
-                        logger.error("Drive API error", error=str(error))
-                        raise DriveClientError(f"Drive API error: {str(error)}")
-                        
-                except Exception as e:
-                    logger.error("Unexpected error listing files", error=str(e))
-                    raise DriveClientError(f"Unexpected error: {str(e)}")
+                        logger.error("Max retries exceeded for rate limit", error=str(error))
+                        raise DriveClientError(f"Rate limit exceeded after {max_retries} retries")
+                else:
+                    logger.error("Drive API error", error=str(error))
+                    raise DriveClientError(f"Drive API error: {str(error)}")
+                    
+            except Exception as e:
+                logger.error("Unexpected error listing files", error=str(e))
+                raise DriveClientError(f"Unexpected error: {str(e)}")
                     
     except Exception as e:
         logger.error("Failed to list files", error=str(e))
         raise DriveClientError(f"Failed to list files: {str(e)}")
-    
-    logger.info("Successfully listed files", count=len(files))
-    return files
 
 def move_item(service: 'Resource', file_id: str, new_parent_id: str) -> Dict:
     """

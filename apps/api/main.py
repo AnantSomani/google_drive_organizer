@@ -8,12 +8,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 import structlog
-from supabase import create_client, Client
+from supabase import create_client
 import openai
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+# Load environment variables from root directory
+load_dotenv("../../.env")
 
 from drive_client import build_service, list_files, move_item, create_folder, DriveClientError
 from classification import propose_structure, summarize_large_file_list
@@ -64,11 +64,29 @@ app.add_middleware(
 supabase_url = os.getenv("SUPABASE_URL")
 supabase_key = os.getenv("SUPABASE_ANON_KEY")
 
+# Debug environment variables
+logger.info(f"SUPABASE_URL from env: {repr(supabase_url)}")
+logger.info(f"SUPABASE_ANON_KEY from env: {repr(supabase_key[:20]) if supabase_key else 'None'}...")
+
+# Fallback to hardcoded values if environment variables are not loaded
+if not supabase_url or not supabase_key:
+    logger.warning("Environment variables not loaded, using hardcoded values")
+    # exposed secrets
+    supabase_url = "https://iulqasfnthyhaikxmlex.supabase.co"
+    # exposed secrets
+    supabase_key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml1bHFhc2ZudGh5aGFpa3htbGV4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQwMDExNTksImV4cCI6MjA2OTU3NzE1OX0.CzY05M-tyfX6uiBAM7MVZ0b00380RFGiavCUdIQanl8"
+
+logger.info(f"Final SUPABASE_URL: {repr(supabase_url)}")
+logger.info(f"Final SUPABASE_ANON_KEY: {repr(supabase_key[:20])}...")
+
 # Initialize Supabase client with error handling
 try:
-    supabase: Client = create_client(supabase_url, supabase_key)
+    supabase = create_client(supabase_url, supabase_key)
+    logger.info("✅ Supabase client initialized successfully")
 except Exception as e:
-    logger.warning(f"Failed to initialize Supabase client: {e}")
+    logger.error(f"❌ Failed to initialize Supabase client: {e}")
+    import traceback
+    logger.error(f"Traceback: {traceback.format_exc()}")
     supabase = None
 
 # Configure OpenAI
@@ -127,7 +145,140 @@ class PreferencesResponse(BaseModel):
     """Response model for user preferences."""
     preferences: Dict
 
+# Google Drive API models
+class DriveFile(BaseModel):
+    """Model for Google Drive file."""
+    id: str
+    name: str
+    mime_type: str
+    size: int = 0
+    created_time: str
+    modified_time: str
+    parents: List[str] = []
+    web_view_link: str = ""
+
+class DriveFolder(BaseModel):
+    """Model for Google Drive folder."""
+    id: str
+    name: str
+    created_time: str
+    modified_time: str
+    parents: List[str] = []
+    web_view_link: str = ""
+
+class DriveScanRequest(BaseModel):
+    """Request model for Drive scan."""
+    include_folders: bool = True
+    include_files: bool = True
+    max_results: int = 1000
+
+class DriveScanResponse(BaseModel):
+    """Response model for Drive scan."""
+    scan_id: str
+    status: str
+    message: str
+    file_count: int = 0
+    folder_count: int = 0
+
+class DriveFilesResponse(BaseModel):
+    """Response model for Drive files list."""
+    files: List[DriveFile]
+    next_page_token: str = None
+    total_count: int
+
+class DriveFoldersResponse(BaseModel):
+    """Response model for Drive folders list."""
+    folders: List[DriveFolder]
+    next_page_token: str = None
+    total_count: int
+
+class DriveScanStatusResponse(BaseModel):
+    """Response model for Drive scan status."""
+    scan_id: str
+    status: str
+    file_count: int
+    folder_count: int
+    processed_count: int
+    error_message: str = None
+    completed_at: str = None
+
 # Dependency to get current user
+async def get_google_oauth_tokens(user_id: str) -> Dict:
+    """Get Google OAuth tokens from database with automatic refresh."""
+    try:
+        client_id = os.getenv("GOOGLE_CLIENT_ID")
+        client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
+        
+        if not client_id or not client_secret:
+            logger.error("Google OAuth credentials not configured in environment")
+            raise Exception("Google OAuth credentials not configured. Please set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET.")
+        
+        # Get tokens from database
+        response = supabase.table("google_tokens").select("*").eq("user_id", user_id).execute()
+        
+        if not response.data:
+            logger.warning("No Google tokens found for user", user_id=user_id)
+            raise Exception("Google Drive not connected. Please sign in with Google OAuth first.")
+        
+        token_data = response.data[0]
+        access_token = token_data["access_token"]
+        refresh_token = token_data["refresh_token"]
+        expires_at = token_data["expires_at"]
+        
+        # Check if token needs refresh (expires in next 2 minutes)
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        expires_at_dt = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
+        
+        if now > expires_at_dt - timedelta(minutes=2):
+            logger.info("Refreshing Google OAuth token", user_id=user_id)
+            new_tokens = await refresh_google_token(refresh_token)
+            
+            # Update database with new tokens
+            supabase.table("google_tokens").update({
+                "access_token": new_tokens["access_token"],
+                "expires_at": new_tokens["expires_at"],
+                "updated_at": "now()"
+            }).eq("user_id", user_id).execute()
+            
+            access_token = new_tokens["access_token"]
+        
+        logger.info("Successfully retrieved Google OAuth tokens", user_id=user_id)
+        
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "token_uri": "https://oauth2.googleapis.com/token"
+        }
+        
+    except Exception as e:
+        logger.error("Failed to get Google OAuth tokens", error=str(e))
+        raise Exception(f"Failed to get Google OAuth tokens: {str(e)}")
+
+async def refresh_google_token(refresh_token: str) -> Dict:
+    """Refresh Google OAuth token."""
+    import httpx
+    import time
+    
+    payload = {
+        "client_id": os.getenv("GOOGLE_CLIENT_ID"),
+        "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+    }
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post("https://oauth2.googleapis.com/token", data=payload)
+        response.raise_for_status()
+        data = response.json()
+        
+        return {
+            "access_token": data["access_token"],
+            "expires_at": (time.time() + data["expires_in"]).isoformat() + "Z"
+        }
+
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict:
     """Get current user from JWT token."""
     if supabase is None:
@@ -136,7 +287,13 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     try:
         # Verify the JWT token with Supabase
         user = supabase.auth.get_user(credentials.credentials)
-        return user.user
+        # Convert User object to dictionary
+        return {
+            "id": user.user.id,
+            "email": user.user.email,
+            "created_at": user.user.created_at,
+            "updated_at": user.user.updated_at
+        }
     except Exception as e:
         logger.error("Failed to authenticate user", error=str(e))
         raise HTTPException(status_code=401, detail="Invalid authentication credentials")
@@ -146,6 +303,49 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
 async def health_check():
     """Health check endpoint."""
     return {"status": "healthy", "service": "drive-organizer-api"}
+
+# Google OAuth token storage endpoint
+class TokenBody(BaseModel):
+    access_token: str
+    refresh_token: str
+    expires_at: int
+    scope: str = "drive"
+
+@app.post("/api/google/store-token")
+async def store_google_token(
+    body: TokenBody,
+    current_user: Dict = Depends(get_current_user)
+):
+    """Store Google OAuth tokens in database."""
+    try:
+        logger.info("Received token storage request", user_id=current_user["id"])
+        
+        # Convert expires_at from timestamp to ISO format
+        from datetime import datetime
+        expires_at = datetime.fromtimestamp(body.expires_at / 1000).isoformat() + "Z"
+        
+        logger.info("Token data", 
+                   user_id=current_user["id"],
+                   has_access_token=bool(body.access_token),
+                   has_refresh_token=bool(body.refresh_token),
+                   expires_at=expires_at)
+        
+        # Upsert tokens into database
+        supabase.table("google_tokens").upsert({
+            "user_id": current_user["id"],
+            "access_token": body.access_token,
+            "refresh_token": body.refresh_token,
+            "expires_at": expires_at,
+            "scope": body.scope
+        }).execute()
+        
+        logger.info("Stored Google OAuth tokens", user_id=current_user["id"])
+        
+        return {"success": True, "message": "Tokens stored successfully"}
+        
+    except Exception as e:
+        logger.error("Failed to store Google tokens", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to store tokens: {str(e)}")
 
 # Metadata ingestion endpoint
 @app.post("/ingest", response_model=IngestResponse)
@@ -540,6 +740,276 @@ async def get_proposals(current_user: Dict = Depends(get_current_user)):
     except Exception as e:
         logger.error("Failed to get proposals", error=str(e))
         raise HTTPException(status_code=500, detail=f"Failed to get proposals: {str(e)}")
+
+# Google Drive API endpoints
+@app.get("/api/drive/files", response_model=DriveFilesResponse)
+async def get_drive_files(
+    page_token: str = None,
+    page_size: int = 50,
+    current_user: Dict = Depends(get_current_user)
+):
+    """List user's Google Drive files with pagination."""
+    try:
+        # Get user's Google OAuth tokens from database
+        try:
+            user_credentials = await get_google_oauth_tokens(current_user["id"])
+        except Exception as e:
+            logger.warning("Failed to get Google OAuth tokens", error=str(e))
+            raise HTTPException(
+                status_code=400, 
+                detail="Please sign in with Google to access Drive files. Error: " + str(e)
+            )
+        
+        # Build Drive service
+        service = build_service(user_credentials)
+        
+        # List files with pagination
+        files_result = list_files(service, page_token=page_token, page_size=page_size)
+        
+        # Convert to Pydantic models
+        drive_files = []
+        files_list = files_result.get("files", [])
+        for file in files_list:
+            drive_files.append(DriveFile(
+                id=file.get("id", ""),
+                name=file.get("name", ""),
+                mime_type=file.get("mimeType", ""),
+                size=int(file.get("size", 0)),
+                created_time=file.get("createdTime", ""),
+                modified_time=file.get("modifiedTime", ""),
+                parents=file.get("parents", []),
+                web_view_link=file.get("webViewLink", "")
+            ))
+        
+        logger.info("Retrieved Drive files", 
+                   user_id=current_user["id"], 
+                   file_count=len(drive_files))
+        
+        return DriveFilesResponse(
+            files=drive_files,
+            next_page_token=files_result.get("nextPageToken"),
+            total_count=len(drive_files)
+        )
+        
+    except DriveClientError as e:
+        logger.error("Drive API error", error=str(e))
+        raise HTTPException(status_code=400, detail=f"Drive API error: {str(e)}")
+    except Exception as e:
+        logger.error("Failed to get Drive files", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to get Drive files: {str(e)}")
+
+@app.get("/api/drive/folders", response_model=DriveFoldersResponse)
+async def get_drive_folders(
+    page_token: str = None,
+    page_size: int = 50,
+    current_user: Dict = Depends(get_current_user)
+):
+    """List user's Google Drive folders with pagination."""
+    try:
+        # Get user's Google OAuth tokens from database
+        try:
+            user_credentials = await get_google_oauth_tokens(current_user["id"])
+        except Exception as e:
+            logger.warning("Failed to get Google OAuth tokens", error=str(e))
+            raise HTTPException(
+                status_code=400, 
+                detail="Please sign in with Google to access Drive folders. Error: " + str(e)
+            )
+        
+        # Build Drive service
+        service = build_service(user_credentials)
+        
+        # List folders (folders are files with mimeType = 'application/vnd.google-apps.folder')
+        folders_result = list_files(service, 
+                                  page_token=page_token, 
+                                  page_size=page_size,
+                                  mime_type="application/vnd.google-apps.folder")
+        
+        # Convert to Pydantic models
+        drive_folders = []
+        folders_list = folders_result.get("files", [])
+        for folder in folders_list:
+            drive_folders.append(DriveFolder(
+                id=folder.get("id", ""),
+                name=folder.get("name", ""),
+                created_time=folder.get("createdTime", ""),
+                modified_time=folder.get("modifiedTime", ""),
+                parents=folder.get("parents", []),
+                web_view_link=folder.get("webViewLink", "")
+            ))
+        
+        logger.info("Retrieved Drive folders", 
+                   user_id=current_user["id"], 
+                   folder_count=len(drive_folders))
+        
+        return DriveFoldersResponse(
+            folders=drive_folders,
+            next_page_token=folders_result.get("nextPageToken"),
+            total_count=len(drive_folders)
+        )
+        
+    except DriveClientError as e:
+        logger.error("Drive API error", error=str(e))
+        raise HTTPException(status_code=400, detail=f"Drive API error: {str(e)}")
+    except Exception as e:
+        logger.error("Failed to get Drive folders", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to get Drive folders: {str(e)}")
+
+@app.post("/api/drive/scan", response_model=DriveScanResponse)
+async def scan_drive(
+    request: DriveScanRequest,
+    background_tasks: BackgroundTasks,
+    access_token: str = None,
+    current_user: Dict = Depends(get_current_user)
+):
+    """Initiate a comprehensive scan of the user's Google Drive."""
+    try:
+        # Create scan record
+        scan_id = str(uuid.uuid4())
+        supabase.table("drive_scans").insert({
+            "id": scan_id,
+            "user_id": current_user["id"],
+            "status": "pending",
+            "include_folders": request.include_folders,
+            "include_files": request.include_files,
+            "max_results": request.max_results
+        }).execute()
+        
+        # Start background scan task
+        background_tasks.add_task(
+            _scan_drive_task,
+            current_user["id"],
+            scan_id,
+            request.include_folders,
+            request.include_files,
+            request.max_results
+        )
+        
+        logger.info("Started Drive scan", 
+                   user_id=current_user["id"], 
+                   scan_id=scan_id)
+        
+        return DriveScanResponse(
+            scan_id=scan_id,
+            status="pending",
+            message="Drive scan started",
+            file_count=0,
+            folder_count=0
+        )
+        
+    except Exception as e:
+        logger.error("Failed to start Drive scan", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to start scan: {str(e)}")
+
+async def _scan_drive_task(
+    user_id: str, 
+    scan_id: str, 
+    include_folders: bool, 
+    include_files: bool, 
+    max_results: int
+):
+    """Background task for comprehensive Drive scanning."""
+    try:
+        # Update status to processing
+        supabase.table("drive_scans").update({
+            "status": "processing"
+        }).eq("id", scan_id).execute()
+        
+        # Get user's Google OAuth tokens from their Supabase session
+        try:
+            user_credentials = await get_google_oauth_tokens(user_id)
+        except Exception as e:
+            logger.warning("Failed to get Google OAuth tokens", error=str(e))
+            raise Exception(f"Please sign in with Google to access Drive. Error: {str(e)}")
+        
+        # Build Drive service
+        service = build_service(user_credentials)
+        
+        file_count = 0
+        folder_count = 0
+        all_files = []
+        all_folders = []
+        
+        # Scan files if requested
+        if include_files:
+            files_result = list_files(service, max_results=max_results)
+            all_files = files_result.get("files", [])
+            file_count = len(all_files)
+            
+            # Store file metadata
+            supabase.table("drive_files").insert({
+                "scan_id": scan_id,
+                "user_id": user_id,
+                "files": all_files
+            }).execute()
+        
+        # Scan folders if requested
+        if include_folders:
+            folders_result = list_files(service, 
+                                      max_results=max_results,
+                                      mime_type="application/vnd.google-apps.folder")
+            all_folders = folders_result.get("files", [])
+            folder_count = len(all_folders)
+            
+            # Store folder metadata
+            supabase.table("drive_folders").insert({
+                "scan_id": scan_id,
+                "user_id": user_id,
+                "folders": all_folders
+            }).execute()
+        
+        # Update scan status
+        supabase.table("drive_scans").update({
+            "status": "completed",
+            "file_count": file_count,
+            "folder_count": folder_count,
+            "completed_at": "now()"
+        }).eq("id", scan_id).execute()
+        
+        logger.info("Completed Drive scan", 
+                   user_id=user_id, 
+                   scan_id=scan_id,
+                   file_count=file_count,
+                   folder_count=folder_count)
+        
+    except Exception as e:
+        logger.error("Failed to scan Drive", error=str(e), scan_id=scan_id)
+        
+        # Update status to error
+        supabase.table("drive_scans").update({
+            "status": "error",
+            "error_message": str(e)
+        }).eq("id", scan_id).execute()
+
+@app.get("/api/drive/scan/status/{scan_id}", response_model=DriveScanStatusResponse)
+async def get_drive_scan_status(
+    scan_id: str,
+    current_user: Dict = Depends(get_current_user)
+):
+    """Get the status of a Drive scan."""
+    try:
+        response = supabase.table("drive_scans").select("*").eq(
+            "id", scan_id
+        ).eq("user_id", current_user["id"]).execute()
+        
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Scan not found")
+        
+        scan_data = response.data[0]
+        
+        return DriveScanStatusResponse(
+            scan_id=scan_id,
+            status=scan_data["status"],
+            file_count=scan_data.get("file_count", 0),
+            folder_count=scan_data.get("folder_count", 0),
+            processed_count=scan_data.get("file_count", 0) + scan_data.get("folder_count", 0),
+            error_message=scan_data.get("error_message"),
+            completed_at=scan_data.get("completed_at")
+        )
+        
+    except Exception as e:
+        logger.error("Failed to get scan status", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to get scan status: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn

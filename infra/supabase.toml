@@ -107,6 +107,15 @@ template = "Your code is {{ .Code }} ."
 # Use an external OAuth provider. The full list of providers are: `apple`, `azure`, `bitbucket`,
 # `discord`, `facebook`, `github`, `gitlab`, `google`, `keycloak`, `linkedin`, `notion`, `twitch`,
 # `twitter`, `slack`, `spotify`, `workos`, `zoom`.
+[auth.external.google]
+enabled = true
+client_id = "env(SUPABASE_AUTH_EXTERNAL_GOOGLE_CLIENT_ID)"
+secret = "env(SUPABASE_AUTH_EXTERNAL_GOOGLE_SECRET)"
+# Overrides the default auth redirectUrl.
+redirect_uri = "https://iulqasfnthyhaikxmlex.supabase.co/auth/v1/callback"
+# Scopes for Google Drive API access
+scopes = ["https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/drive.metadata.readonly"]
+
 # [auth.external.apple]
 # enabled = false
 # client_id = ""

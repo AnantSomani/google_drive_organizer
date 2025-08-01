@@ -20,6 +20,45 @@ export default function AuthCallbackPage() {
         }
 
         if (data.session) {
+          // Debug: Log session data
+          console.log('Session data:', {
+            hasProviderToken: !!data.session.provider_token,
+            hasProviderRefreshToken: !!data.session.provider_refresh_token,
+            provider: data.session.user?.app_metadata?.provider,
+            expiresIn: data.session.expires_in
+          })
+          
+          // Store Google OAuth tokens if available
+          if (data.session.provider_token && data.session.provider_refresh_token) {
+            console.log('Attempting to store Google tokens...')
+            try {
+              const response = await fetch('http://localhost:3030/api/google/store-token', {
+                method: 'POST',
+                headers: { 
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${data.session.access_token}`
+                },
+                body: JSON.stringify({
+                  access_token: data.session.provider_token,
+                  refresh_token: data.session.provider_refresh_token,
+                  expires_at: Date.now() + (data.session.expires_in || 3600) * 1000,
+                  scope: 'drive'
+                })
+              })
+              
+              if (response.ok) {
+                console.log('Google tokens stored successfully')
+              } else {
+                const errorData = await response.json()
+                console.error('Failed to store Google tokens:', errorData)
+              }
+            } catch (tokenError) {
+              console.error('Error storing Google tokens:', tokenError)
+            }
+          } else {
+            console.log('No provider tokens available in session')
+          }
+          
           // Successfully authenticated, redirect to dashboard
           router.push('/dashboard')
         } else {

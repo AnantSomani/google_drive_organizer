@@ -43,7 +43,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const { error } = await supabase.auth.signInWithOAuth({
       provider: 'google',
       options: {
-        redirectTo: `${window.location.origin}/auth/callback`
+        // Drive scopes we need
+        scopes: [
+          'https://www.googleapis.com/auth/drive',
+          'https://www.googleapis.com/auth/drive.metadata.readonly'
+        ].join(' '),
+        redirectTo: `${window.location.origin}/auth/callback`,
+        // Critical extras for refresh tokens
+        queryParams: {
+          access_type: 'offline',   // asks Google for a refresh token
+          prompt: 'consent'         // forces refresh_token the first time
+        }
       }
     })
     
