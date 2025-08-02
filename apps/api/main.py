@@ -2,7 +2,7 @@
 
 import os
 import uuid
-from typing import Dict, List
+from typing import Dict, List, Optional
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -199,8 +199,8 @@ class DriveScanStatusResponse(BaseModel):
     file_count: int
     folder_count: int
     processed_count: int
-    error_message: str = None
-    completed_at: str = None
+    error_message: Optional[str] = None
+    completed_at: Optional[str] = None
 
 class TreeNode(BaseModel):
     """Model for tree node structure."""
@@ -951,33 +951,35 @@ async def _scan_drive_task(
         # Build Drive service
         service = build_service(user_credentials)
         
-        file_count = 0
-        folder_count = 0
         all_files = []
         all_folders = []
         
-        # Scan files if requested
-        if include_files:
-            files_result = list_files(service, max_results=max_results)
-            all_files = files_result.get("files", [])
-            file_count = len(all_files)
+        # Recursively scan all items (files and folders)
+        if include_files or include_folders:
+            all_items = await _recursive_scan_drive(service, max_results=max_results)
             
-            # Store file metadata
+            # Separate files and folders
+            for item in all_items:
+                if item.get("mimeType") == "application/vnd.google-apps.folder":
+                    if include_folders:
+                        all_folders.append(item)
+                else:
+                    if include_files:
+                        all_files.append(item)
+        
+        file_count = len(all_files)
+        folder_count = len(all_folders)
+        
+        # Store file metadata
+        if all_files:
             supabase.table("drive_files").insert({
                 "scan_id": scan_id,
                 "user_id": user_id,
                 "files": all_files
             }).execute()
         
-        # Scan folders if requested
-        if include_folders:
-            folders_result = list_files(service, 
-                                      max_results=max_results,
-                                      mime_type="application/vnd.google-apps.folder")
-            all_folders = folders_result.get("files", [])
-            folder_count = len(all_folders)
-            
-            # Store folder metadata
+        # Store folder metadata
+        if all_folders:
             supabase.table("drive_folders").insert({
                 "scan_id": scan_id,
                 "user_id": user_id,
@@ -1006,6 +1008,76 @@ async def _scan_drive_task(
             "status": "error",
             "error_message": str(e)
         }).eq("id", scan_id).execute()
+
+async def _recursive_scan_drive(service, max_results: int = 1000, parent_id: str = None) -> List[Dict]:
+    """Recursively scan Google Drive to get all files and folders."""
+    all_items = []
+    
+    try:
+        # Build query for items in the current folder (or root if parent_id is None)
+        query = "trashed=false"
+        if parent_id:
+            query += f" and '{parent_id}' in parents"
+        else:
+            query += " and 'root' in parents"
+        
+        # Get items in current folder
+        results = service.files().list(
+            q=query,
+            pageSize=1000,
+            fields="nextPageToken, files(id, name, mimeType, parents, createdTime, modifiedTime, size, webViewLink)"
+        ).execute()
+        
+        items = results.get('files', [])
+        
+        for item in items:
+            all_items.append(item)
+            
+            # If this is a folder, recursively scan its contents
+            if item.get("mimeType") == "application/vnd.google-apps.folder":
+                logger.info(f"Scanning folder: {item.get('name', 'Unknown')} (ID: {item.get('id')})")
+                sub_items = await _recursive_scan_drive(service, max_results, item.get('id'))
+                all_items.extend(sub_items)
+            
+            # Check if we've reached the max results limit
+            if max_results and len(all_items) >= max_results:
+                all_items = all_items[:max_results]
+                break
+        
+        # Handle pagination
+        while 'nextPageToken' in results and (not max_results or len(all_items) < max_results):
+            results = service.files().list(
+                q=query,
+                pageSize=1000,
+                pageToken=results['nextPageToken'],
+                fields="nextPageToken, files(id, name, mimeType, parents, createdTime, modifiedTime, size, webViewLink)"
+            ).execute()
+            
+            items = results.get('files', [])
+            
+            for item in items:
+                all_items.append(item)
+                
+                # If this is a folder, recursively scan its contents
+                if item.get("mimeType") == "application/vnd.google-apps.folder":
+                    logger.info(f"Scanning folder: {item.get('name', 'Unknown')} (ID: {item.get('id')})")
+                    sub_items = await _recursive_scan_drive(service, max_results, item.get('id'))
+                    all_items.extend(sub_items)
+                
+                # Check if we've reached the max results limit
+                if max_results and len(all_items) >= max_results:
+                    all_items = all_items[:max_results]
+                    break
+            
+            if max_results and len(all_items) >= max_results:
+                break
+        
+        logger.info(f"Scanned {len(all_items)} items from folder {parent_id or 'root'}")
+        return all_items
+        
+    except Exception as e:
+        logger.error(f"Error scanning folder {parent_id or 'root'}", error=str(e))
+        return all_items
 
 @app.get("/api/drive/scan/status/{scan_id}", response_model=DriveScanStatusResponse)
 async def get_drive_scan_status(
