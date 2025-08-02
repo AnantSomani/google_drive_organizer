@@ -150,10 +150,10 @@ class DriveFile(BaseModel):
     """Model for Google Drive file."""
     id: str
     name: str
-    mime_type: str
+    mime_type: str = ""
     size: int = 0
-    created_time: str
-    modified_time: str
+    created_time: str = ""
+    modified_time: str = ""
     parents: List[str] = []
     web_view_link: str = ""
 
@@ -161,8 +161,8 @@ class DriveFolder(BaseModel):
     """Model for Google Drive folder."""
     id: str
     name: str
-    created_time: str
-    modified_time: str
+    created_time: str = ""
+    modified_time: str = ""
     parents: List[str] = []
     web_view_link: str = ""
 
@@ -201,6 +201,31 @@ class DriveScanStatusResponse(BaseModel):
     processed_count: int
     error_message: str = None
     completed_at: str = None
+
+class TreeNode(BaseModel):
+    """Model for tree node structure."""
+    id: str
+    name: str
+    type: str  # 'file' or 'folder'
+    mime_type: str = None
+    size: int = None
+    created_time: str = None
+    modified_time: str = None
+    parents: List[str] = []
+    web_view_link: str = ""
+    children: List['TreeNode'] = []
+    level: int = 0
+
+class ScanResultsResponse(BaseModel):
+    """Response model for scan results with tree structure."""
+    scan_id: str
+    status: str
+    file_count: int
+    folder_count: int
+    scan_timestamp: str
+    tree_data: TreeNode
+    files: List[DriveFile] = []
+    folders: List[DriveFolder] = []
 
 # Dependency to get current user
 async def get_google_oauth_tokens(user_id: str) -> Dict:
@@ -1011,6 +1036,220 @@ async def get_drive_scan_status(
     except Exception as e:
         logger.error("Failed to get scan status", error=str(e))
         raise HTTPException(status_code=500, detail=f"Failed to get scan status: {str(e)}")
+
+def build_tree_structure(files: List[Dict], folders: List[Dict]) -> TreeNode:
+    """Build a tree structure from files and folders data."""
+    try:
+        # Create a map of all items by ID
+        items_map = {}
+        
+        # Add folders to the map
+        for folder in folders:
+            try:
+                items_map[folder["id"]] = {
+                    "id": folder["id"],
+                    "name": folder["name"],
+                    "type": "folder",
+                    "created_time": folder.get("createdTime", ""),
+                    "modified_time": folder.get("modifiedTime", ""),
+                    "parents": folder.get("parents", []),
+                    "web_view_link": folder.get("webViewLink", ""),
+                    "children": [],
+                    "level": 0
+                }
+            except KeyError as e:
+                logger.warning(f"Missing required field in folder: {e}", folder_id=folder.get("id"))
+                continue
+        
+        # Add files to the map
+        for file in files:
+            try:
+                items_map[file["id"]] = {
+                    "id": file["id"],
+                    "name": file["name"],
+                    "type": "file",
+                    "mime_type": file.get("mimeType", ""),
+                    "size": file.get("size", 0),
+                    "created_time": file.get("createdTime", ""),
+                    "modified_time": file.get("modifiedTime", ""),
+                    "parents": file.get("parents", []),
+                    "web_view_link": file.get("webViewLink", ""),
+                    "children": [],
+                    "level": 0
+                }
+            except KeyError as e:
+                logger.warning(f"Missing required field in file: {e}", file_id=file.get("id"))
+                continue
+        
+        # Build the tree structure
+        root_items = []
+        
+        for item_id, item in items_map.items():
+            if not item["parents"] or "root" in item["parents"]:
+                # This is a root item
+                root_items.append(item)
+            else:
+                # This item has parents, add it to the appropriate parent
+                for parent_id in item["parents"]:
+                    if parent_id in items_map:
+                        parent = items_map[parent_id]
+                        parent["children"].append(item)
+                        item["level"] = parent["level"] + 1
+                    else:
+                        # Parent not found, treat as root item
+                        logger.warning(f"Parent {parent_id} not found for item {item_id}, treating as root")
+                        root_items.append(item)
+                        break
+        
+        # Create the root node
+        root_node = TreeNode(
+            id="root",
+            name="My Drive",
+            type="folder",
+            children=root_items,
+            level=0
+        )
+        
+        return root_node
+        
+    except Exception as e:
+        logger.error("Failed to build tree structure", error=str(e))
+        # Return a minimal root node if tree building fails
+        return TreeNode(
+            id="root",
+            name="My Drive",
+            type="folder",
+            children=[],
+            level=0
+        )
+
+@app.get("/api/drive/scan-results/latest", response_model=ScanResultsResponse)
+async def get_latest_scan_results(
+    current_user: Dict = Depends(get_current_user)
+):
+    """Get the latest completed scan results for the current user."""
+    try:
+        # Get the latest completed scan
+        scan_response = supabase.table("drive_scans").select("*").eq(
+            "user_id", current_user["id"]
+        ).eq("status", "completed").order("completed_at", desc=True).limit(1).execute()
+        
+        if not scan_response.data:
+            raise HTTPException(
+                status_code=404, 
+                detail="No completed scans found. Please run a scan first."
+            )
+        
+        scan_data = scan_response.data[0]
+        scan_id = scan_data["id"]
+        
+        # Get files data
+        files_response = supabase.table("drive_files").select("files").eq(
+            "scan_id", scan_id
+        ).eq("user_id", current_user["id"]).execute()
+        
+        files = []
+        if files_response.data:
+            files = files_response.data[0]["files"]
+        
+        # Get folders data
+        folders_response = supabase.table("drive_folders").select("folders").eq(
+            "scan_id", scan_id
+        ).eq("user_id", current_user["id"]).execute()
+        
+        folders = []
+        if folders_response.data:
+            folders = folders_response.data[0]["folders"]
+        
+        # Build tree structure
+        tree_data = build_tree_structure(files, folders)
+        
+        # Convert to Pydantic models for response
+        drive_files = [DriveFile(**file) for file in files]
+        drive_folders = [DriveFolder(**folder) for folder in folders]
+        
+        return ScanResultsResponse(
+            scan_id=scan_id,
+            status=scan_data["status"],
+            file_count=scan_data.get("file_count", 0),
+            folder_count=scan_data.get("folder_count", 0),
+            scan_timestamp=scan_data.get("completed_at", scan_data.get("started_at")),
+            tree_data=tree_data,
+            files=drive_files,
+            folders=drive_folders
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to get latest scan results", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to get latest scan results: {str(e)}")
+
+@app.get("/api/drive/scan-results/{scan_id}", response_model=ScanResultsResponse)
+async def get_scan_results(
+    scan_id: str,
+    current_user: Dict = Depends(get_current_user)
+):
+    """Get the complete scan results with tree structure for a specific scan."""
+    try:
+        # Get scan metadata
+        scan_response = supabase.table("drive_scans").select("*").eq(
+            "id", scan_id
+        ).eq("user_id", current_user["id"]).execute()
+        
+        if not scan_response.data:
+            raise HTTPException(status_code=404, detail="Scan not found")
+        
+        scan_data = scan_response.data[0]
+        
+        # Check if scan is completed
+        if scan_data["status"] != "completed":
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Scan is not completed. Current status: {scan_data['status']}"
+            )
+        
+        # Get files data
+        files_response = supabase.table("drive_files").select("files").eq(
+            "scan_id", scan_id
+        ).eq("user_id", current_user["id"]).execute()
+        
+        files = []
+        if files_response.data:
+            files = files_response.data[0]["files"]
+        
+        # Get folders data
+        folders_response = supabase.table("drive_folders").select("folders").eq(
+            "scan_id", scan_id
+        ).eq("user_id", current_user["id"]).execute()
+        
+        folders = []
+        if folders_response.data:
+            folders = folders_response.data[0]["folders"]
+        
+        # Build tree structure
+        tree_data = build_tree_structure(files, folders)
+        
+        # Convert to Pydantic models for response
+        drive_files = [DriveFile(**file) for file in files]
+        drive_folders = [DriveFolder(**folder) for folder in folders]
+        
+        return ScanResultsResponse(
+            scan_id=scan_id,
+            status=scan_data["status"],
+            file_count=scan_data.get("file_count", 0),
+            folder_count=scan_data.get("folder_count", 0),
+            scan_timestamp=scan_data.get("completed_at", scan_data.get("started_at")),
+            tree_data=tree_data,
+            files=drive_files,
+            folders=drive_folders
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to get scan results", error=str(e), scan_id=scan_id)
+        raise HTTPException(status_code=500, detail=f"Failed to get scan results: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
