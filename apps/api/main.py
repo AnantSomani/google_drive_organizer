@@ -261,6 +261,7 @@ async def refresh_google_token(refresh_token: str) -> Dict:
     """Refresh Google OAuth token."""
     import httpx
     import time
+    from datetime import datetime
     
     payload = {
         "client_id": os.getenv("GOOGLE_CLIENT_ID"),
@@ -276,7 +277,7 @@ async def refresh_google_token(refresh_token: str) -> Dict:
         
         return {
             "access_token": data["access_token"],
-            "expires_at": (time.time() + data["expires_in"]).isoformat() + "Z"
+            "expires_at": datetime.fromtimestamp(time.time() + data["expires_in"]).isoformat() + "Z"
         }
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict:
