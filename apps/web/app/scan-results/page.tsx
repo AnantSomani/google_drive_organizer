@@ -18,6 +18,7 @@ import {
 import TreeList from './components/TreeList'
 import TreeDiagram from './components/TreeDiagram'
 import FileDetailsPanel from './components/FileDetailsPanel'
+import AIProposalView from './components/AIProposalView'
 
 // Types for the scan results
 interface TreeNode {
@@ -56,6 +57,13 @@ export default function ScanResultsPage() {
   const [scanData, setScanData] = useState<ScanResults | null>(null)
   const [loadingData, setLoadingData] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  
+  // AI state variables
+  const [aiAnalysisId, setAiAnalysisId] = useState<string | null>(null)
+  const [aiAnalysisStatus, setAiAnalysisStatus] = useState<string | null>(null)
+  const [aiProposal, setAiProposal] = useState<any>(null)
+  const [showAIProposal, setShowAIProposal] = useState(false)
+  const [loadingAI, setLoadingAI] = useState(false)
 
   useEffect(() => {
     if (!loading && !user) {
@@ -210,6 +218,143 @@ export default function ScanResultsPage() {
     })
   }
 
+  // AI Organization Functions
+  const handleAIOrganization = async () => {
+    if (!scanData) return
+    
+    try {
+      setLoadingAI(true)
+      setError(null)
+      
+      // Get session token
+      const { data: { session } } = await supabase.auth.getSession()
+      const sessionToken = session?.access_token
+      
+      if (!sessionToken) {
+        throw new Error('No session token available')
+      }
+      
+      // Start AI analysis
+      const response = await fetch(`/api/ai/analyze/${scanData.scan_id}`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${sessionToken}`,
+          'Content-Type': 'application/json'
+        }
+      })
+      
+      if (!response.ok) {
+        throw new Error('Failed to start AI analysis')
+      }
+      
+      const result = await response.json()
+      setAiAnalysisId(result.analysis_id)
+      setAiAnalysisStatus('processing')
+      
+      // Poll for results
+      await pollAIResults(result.analysis_id, sessionToken)
+      
+    } catch (error: any) {
+      setError('AI analysis failed: ' + error.message)
+    } finally {
+      setLoadingAI(false)
+    }
+  }
+
+  const pollAIResults = async (analysisId: string, sessionToken: string) => {
+    const poll = async () => {
+      try {
+        const response = await fetch(`/api/ai/analysis/${analysisId}`, {
+          headers: {
+            'Authorization': `Bearer ${sessionToken}`,
+            'Content-Type': 'application/json'
+          }
+        })
+        
+        if (!response.ok) {
+          throw new Error('Failed to check AI analysis status')
+        }
+        
+        const status = await response.json()
+        setAiAnalysisStatus(status.status)
+        
+        if (status.status === 'completed') {
+          // Get proposal
+          const proposalResponse = await fetch(`/api/ai/proposal/${analysisId}`, {
+            headers: {
+              'Authorization': `Bearer ${sessionToken}`,
+              'Content-Type': 'application/json'
+            }
+          })
+          
+          if (proposalResponse.ok) {
+            const proposal = await proposalResponse.json()
+            setAiProposal(proposal)
+            setShowAIProposal(true)
+          }
+          return
+        } else if (status.status === 'error') {
+          setError('AI analysis failed: ' + (status.error_message || 'Unknown error'))
+          return
+        }
+        
+        // Continue polling
+        setTimeout(poll, 2000)
+        
+      } catch (error: any) {
+        setError('Failed to check AI analysis status: ' + error.message)
+      }
+    }
+    
+    poll()
+  }
+
+  const handleApplyAIProposal = async () => {
+    if (!aiAnalysisId || !aiProposal) return
+    
+    try {
+      setLoadingAI(true)
+      
+      const { data: { session } } = await supabase.auth.getSession()
+      const sessionToken = session?.access_token
+      
+      if (!sessionToken) {
+        throw new Error('No session token available')
+      }
+      
+      const response = await fetch(`/api/ai/apply/${aiAnalysisId}`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${sessionToken}`,
+          'Content-Type': 'application/json'
+        }
+      })
+      
+      if (!response.ok) {
+        throw new Error('Failed to apply AI proposal')
+      }
+      
+      const result = await response.json()
+      
+      // Show success message
+      alert(`Successfully applied ${result.results.successful_moves.length} file moves!`)
+      
+      // Refresh scan data
+      await fetchLatestScanResults()
+      
+      // Reset AI state
+      setShowAIProposal(false)
+      setAiProposal(null)
+      setAiAnalysisId(null)
+      setAiAnalysisStatus(null)
+      
+    } catch (error: any) {
+      setError('Failed to apply AI proposal: ' + error.message)
+    } finally {
+      setLoadingAI(false)
+    }
+  }
+
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center">
@@ -291,9 +436,13 @@ export default function ScanResultsPage() {
                 <RefreshCw className={`w-4 h-4 ${loadingData ? 'animate-spin' : ''}`} />
                 {loadingData ? 'Scanning...' : 'Rescan Drive'}
               </button>
-              <button className="btn btn-primary flex items-center gap-2">
-                <Brain className="w-4 h-4" />
-                Organize with AI
+              <button 
+                onClick={handleAIOrganization}
+                disabled={loadingAI || !scanData}
+                className="btn btn-primary flex items-center gap-2 disabled:opacity-50"
+              >
+                <Brain className={`w-4 h-4 ${loadingAI ? 'animate-spin' : ''}`} />
+                {loadingAI ? 'Analyzing...' : 'Organize with AI'}
               </button>
             </div>
           </div>
@@ -427,6 +576,31 @@ export default function ScanResultsPage() {
                 <RefreshCw className="w-4 h-4" />
                 Start First Scan
               </button>
+            </div>
+          </div>
+        )}
+
+        {/* AI Proposal Modal */}
+        {showAIProposal && aiProposal && (
+          <AIProposalView
+            proposal={aiProposal}
+            onApply={handleApplyAIProposal}
+            onCancel={() => {
+              setShowAIProposal(false)
+              setAiProposal(null)
+              setAiAnalysisId(null)
+              setAiAnalysisStatus(null)
+            }}
+            loading={loadingAI}
+          />
+        )}
+
+        {/* AI Analysis Progress Indicator */}
+        {aiAnalysisStatus === 'processing' && (
+          <div className="fixed bottom-4 right-4 bg-blue-600 text-white px-4 py-2 rounded-lg shadow-lg">
+            <div className="flex items-center gap-2">
+              <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+              <span>AI Analysis in Progress...</span>
             </div>
           </div>
         )}

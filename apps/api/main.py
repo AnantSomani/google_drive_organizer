@@ -227,6 +227,33 @@ class ScanResultsResponse(BaseModel):
     files: List[DriveFile] = []
     folders: List[DriveFolder] = []
 
+
+class AIProposal(BaseModel):
+    """AI-generated organization proposal"""
+    scan_id: str
+    generated_at: str
+    total_items: int
+    proposed_folders: List[Dict]
+    file_moves: List[Dict]
+
+class AIAnalysisRequest(BaseModel):
+    """Request model for AI analysis"""
+    scan_id: str
+
+class AIAnalysisResponse(BaseModel):
+    """Response model for AI analysis"""
+    analysis_id: str
+    status: str
+    message: str
+
+class AIAnalysisStatusResponse(BaseModel):
+    """Response model for AI analysis status"""
+    analysis_id: str
+    status: str
+    progress: int = 0
+    error_message: Optional[str] = None
+    completed_at: Optional[str] = None
+
 # Dependency to get current user
 async def get_google_oauth_tokens(user_id: str) -> Dict:
     """Get Google OAuth tokens from database with automatic refresh."""
@@ -1322,6 +1349,332 @@ async def get_scan_results(
     except Exception as e:
         logger.error("Failed to get scan results", error=str(e), scan_id=scan_id)
         raise HTTPException(status_code=500, detail=f"Failed to get scan results: {str(e)}")
+
+# Initialize AI service
+try:
+    from ai_service import AIService
+    ai_service = AIService()
+    logger.info("✅ AI service initialized successfully")
+except Exception as e:
+    logger.error(f"❌ Failed to initialize AI service: {e}")
+    ai_service = None
+
+@app.post("/api/ai/analyze/{scan_id}", response_model=AIAnalysisResponse)
+async def analyze_drive_with_ai(
+    scan_id: str,
+    background_tasks: BackgroundTasks,
+    current_user: Dict = Depends(get_current_user)
+):
+    """Start AI analysis of drive structure"""
+    try:
+        if not ai_service:
+            raise HTTPException(status_code=500, detail="AI service not available")
+        
+        # Check if analysis already exists for this scan
+        existing_response = supabase.table("ai_analyses").select("id, status").eq(
+            "scan_id", scan_id
+        ).eq("user_id", current_user["id"]).execute()
+        
+        if existing_response.data:
+            existing_analysis = existing_response.data[0]
+            analysis_id = existing_analysis["id"]
+            
+            # If analysis is already completed, return it
+            if existing_analysis["status"] == "completed":
+                return AIAnalysisResponse(
+                    analysis_id=analysis_id,
+                    status="completed",
+                    message="Analysis already completed"
+                )
+            
+            # If analysis is in progress, return it
+            if existing_analysis["status"] == "processing":
+                return AIAnalysisResponse(
+                    analysis_id=analysis_id,
+                    status="processing",
+                    message="Analysis already in progress"
+                )
+            
+            # If analysis failed, we can restart it
+            # Update the existing record
+            supabase.table("ai_analyses").update({
+                "status": "processing",
+                "progress": 0,
+                "error_message": None,
+                "completed_at": None
+            }).eq("id", analysis_id).execute()
+        else:
+            # Generate new analysis ID
+            analysis_id = str(uuid.uuid4())
+            
+            # Store analysis status
+            supabase.table("ai_analyses").insert({
+                "id": analysis_id,
+                "scan_id": scan_id,
+                "user_id": current_user["id"],
+                "status": "processing",
+                "created_at": "now()"
+            }).execute()
+        
+        # Start background task
+        background_tasks.add_task(
+            _ai_analysis_task,
+            analysis_id=analysis_id,
+            scan_id=scan_id,
+            user_id=current_user["id"]
+        )
+        
+        return AIAnalysisResponse(
+            analysis_id=analysis_id,
+            status="processing",
+            message="AI analysis started"
+        )
+        
+    except Exception as e:
+        logger.error("Failed to start AI analysis", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to start analysis: {str(e)}")
+
+@app.get("/api/ai/analysis/{analysis_id}", response_model=AIAnalysisStatusResponse)
+async def get_ai_analysis_status(
+    analysis_id: str,
+    current_user: Dict = Depends(get_current_user)
+):
+    """Get AI analysis status"""
+    try:
+        response = supabase.table("ai_analyses").select("*").eq(
+            "id", analysis_id
+        ).eq("user_id", current_user["id"]).execute()
+        
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Analysis not found")
+        
+        analysis_data = response.data[0]
+        
+        return AIAnalysisStatusResponse(
+            analysis_id=analysis_id,
+            status=analysis_data["status"],
+            progress=analysis_data.get("progress", 0),
+            error_message=analysis_data.get("error_message"),
+            completed_at=analysis_data.get("completed_at")
+        )
+        
+    except Exception as e:
+        logger.error("Failed to get analysis status", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to get status: {str(e)}")
+
+@app.get("/api/ai/proposal/{analysis_id}")
+async def get_ai_proposal(
+    analysis_id: str,
+    current_user: Dict = Depends(get_current_user)
+):
+    """Get AI-generated organization proposal"""
+    try:
+        # Get analysis data
+        response = supabase.table("ai_analyses").select("*").eq(
+            "id", analysis_id
+        ).eq("user_id", current_user["id"]).execute()
+        
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Analysis not found")
+        
+        analysis_data = response.data[0]
+        
+        if analysis_data["status"] != "completed":
+            raise HTTPException(status_code=400, detail="Analysis not completed")
+        
+        # Get proposal data
+        proposal_response = supabase.table("ai_proposals").select("*").eq(
+            "analysis_id", analysis_id
+        ).execute()
+        
+        if not proposal_response.data:
+            raise HTTPException(status_code=404, detail="Proposal not found")
+        
+        return proposal_response.data[0]["proposal_data"]
+        
+    except Exception as e:
+        logger.error("Failed to get AI proposal", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to get proposal: {str(e)}")
+
+@app.post("/api/ai/apply/{analysis_id}")
+async def apply_ai_proposal(
+    analysis_id: str,
+    current_user: Dict = Depends(get_current_user)
+):
+    """Apply AI proposal to Google Drive"""
+    try:
+        # Get proposal
+        proposal_response = supabase.table("ai_proposals").select("*").eq(
+            "analysis_id", analysis_id
+        ).execute()
+        
+        if not proposal_response.data:
+            raise HTTPException(status_code=404, detail="Proposal not found")
+        
+        proposal_data = proposal_response.data[0]["proposal_data"]
+        
+        # Get Google Drive service
+        user_credentials = await get_google_oauth_tokens(current_user["id"])
+        service = build_service(user_credentials)
+        
+        # Apply changes
+        results = await _apply_ai_proposal(service, proposal_data)
+        
+        return {
+            "success": True,
+            "results": results,
+            "message": f"Applied {len(results['successful_moves'])} moves successfully"
+        }
+        
+    except Exception as e:
+        logger.error("Failed to apply AI proposal", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def _ai_analysis_task(analysis_id: str, scan_id: str, user_id: str):
+    """Background task for AI analysis"""
+    try:
+        # Update status to processing
+        supabase.table("ai_analyses").update({
+            "status": "processing",
+            "progress": 10
+        }).eq("id", analysis_id).execute()
+        
+        # Get scan data
+        scan_response = supabase.table("drive_scans").select("*").eq(
+            "id", scan_id
+        ).eq("user_id", user_id).execute()
+        
+        if not scan_response.data:
+            raise Exception("Scan not found")
+        
+        scan_data = scan_response.data[0]
+        
+        # Get files and folders
+        files_response = supabase.table("drive_files").select("*").eq(
+            "scan_id", scan_id
+        ).execute()
+        
+        folders_response = supabase.table("drive_folders").select("*").eq(
+            "scan_id", scan_id
+        ).execute()
+        
+        files = files_response.data[0]["files"] if files_response.data else []
+        folders = folders_response.data[0]["folders"] if folders_response.data else []
+        
+        # Update progress
+        supabase.table("ai_analyses").update({
+            "progress": 30
+        }).eq("id", analysis_id).execute()
+        
+        # Generate AI proposal
+        proposal = await ai_service.generate_proposal(scan_id, files, folders)
+        
+        # Update progress
+        supabase.table("ai_analyses").update({
+            "progress": 80
+        }).eq("id", analysis_id).execute()
+        
+        # Store proposal
+        supabase.table("ai_proposals").insert({
+            "analysis_id": analysis_id,
+            "scan_id": scan_id,
+            "user_id": user_id,
+            "proposal_data": proposal,
+            "created_at": "now()"
+        }).execute()
+        
+        # Update status to completed
+        supabase.table("ai_analyses").update({
+            "status": "completed",
+            "progress": 100,
+            "completed_at": "now()"
+        }).eq("id", analysis_id).execute()
+        
+        logger.info(f"AI analysis completed for {analysis_id}")
+        
+    except Exception as e:
+        logger.error(f"AI analysis failed for {analysis_id}: {str(e)}")
+        
+        # Update status to error
+        supabase.table("ai_analyses").update({
+            "status": "error",
+            "error_message": str(e)
+        }).eq("id", analysis_id).execute()
+
+async def _apply_ai_proposal(service, proposal_data: Dict) -> Dict:
+    """Apply AI proposal to Google Drive"""
+    results = {
+        "successful_moves": [],
+        "failed_moves": [],
+        "created_folders": []
+    }
+    
+    try:
+        # Create folders and track their IDs
+        folder_map = {}
+        for folder in proposal_data["proposed_folders"]:
+            try:
+                folder_id = await _ensure_folder_exists(service, folder["name"])
+                folder_map[folder["name"]] = folder_id
+                results["created_folders"].append({
+                    "name": folder["name"],
+                    "id": folder_id
+                })
+            except Exception as e:
+                logger.error(f"Failed to create folder {folder['name']}: {str(e)}")
+        
+        # Move files
+        for move in proposal_data["file_moves"]:
+            try:
+                target_folder_id = folder_map.get(move["proposed_folder"])
+                if target_folder_id:
+                    await move_item(service, move["file_id"], target_folder_id)
+                    results["successful_moves"].append(move["file_id"])
+                else:
+                    results["failed_moves"].append({
+                        "file_id": move["file_id"],
+                        "error": f"Target folder '{move['proposed_folder']}' not found"
+                    })
+            except Exception as e:
+                results["failed_moves"].append({
+                    "file_id": move["file_id"],
+                    "error": str(e)
+                })
+        
+        return results
+        
+    except Exception as e:
+        logger.error(f"Failed to apply AI proposal: {str(e)}")
+        raise e
+
+async def _ensure_folder_exists(service, folder_name: str, parent_id: str = None) -> str:
+    """Ensure folder exists, create if it doesn't"""
+    try:
+        # Try to find existing folder
+        query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+        if parent_id:
+            query += f" and '{parent_id}' in parents"
+        
+        results = service.files().list(q=query, fields="files(id,name)").execute()
+        files = results.get('files', [])
+        
+        if files:
+            return files[0]['id']
+        
+        # Create new folder
+        folder_metadata = {
+            'name': folder_name,
+            'mimeType': 'application/vnd.google-apps.folder'
+        }
+        if parent_id:
+            folder_metadata['parents'] = [parent_id]
+        
+        folder = service.files().create(body=folder_metadata, fields='id').execute()
+        return folder['id']
+        
+    except Exception as e:
+        logger.error(f"Failed to ensure folder exists: {str(e)}")
+        raise e
 
 if __name__ == "__main__":
     import uvicorn
