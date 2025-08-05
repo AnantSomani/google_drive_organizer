@@ -53,7 +53,10 @@ app.add_middleware(
         "http://localhost:3000",
         "https://localhost:3000",
         "https://*.vercel.app",
-        "https://*.railway.app"
+        "https://*.railway.app",
+        "https://*.render.com",
+        "https://*.fly.dev",
+        os.getenv("FRONTEND_URL", "https://your-app.vercel.app")  # Add your actual domain
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -68,13 +71,10 @@ supabase_key = os.getenv("SUPABASE_ANON_KEY")
 logger.info(f"SUPABASE_URL from env: {repr(supabase_url)}")
 logger.info(f"SUPABASE_ANON_KEY from env: {repr(supabase_key[:20]) if supabase_key else 'None'}...")
 
-# Fallback to hardcoded values if environment variables are not loaded
+# Validate required environment variables
 if not supabase_url or not supabase_key:
-    logger.warning("Environment variables not loaded, using hardcoded values")
-    # exposed secrets
-    supabase_url = "https://iulqasfnthyhaikxmlex.supabase.co"
-    # exposed secrets
-    supabase_key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml1bHFhc2ZudGh5aGFpa3htbGV4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQwMDExNTksImV4cCI6MjA2OTU3NzE1OX0.CzY05M-tyfX6uiBAM7MVZ0b00380RFGiavCUdIQanl8"
+    logger.error("SUPABASE_URL and SUPABASE_ANON_KEY must be set in environment variables")
+    raise ValueError("SUPABASE_URL and SUPABASE_ANON_KEY must be set in environment variables")
 
 logger.info(f"Final SUPABASE_URL: {repr(supabase_url)}")
 logger.info(f"Final SUPABASE_ANON_KEY: {repr(supabase_key[:20])}...")
@@ -1678,4 +1678,13 @@ async def _ensure_folder_exists(service, folder_name: str, parent_id: str = None
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=3030) 
+    import os
+    
+    # Get port from environment (Railway sets PORT)
+    port = int(os.getenv("PORT", 3030))
+    host = os.getenv("HOST", "0.0.0.0")
+    
+    print(f"Starting Drive Organizer API on {host}:{port}")
+    print(f"PORT environment variable: {os.getenv('PORT', 'not set')}")
+    print(f"All environment variables: {dict(os.environ)}")
+    uvicorn.run(app, host=host, port=port) 

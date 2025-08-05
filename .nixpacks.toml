@@ -1,0 +1,8 @@
+[phases.setup]
+nixPkgs = ["python312", "pip"]
+
+[phases.install]
+cmds = ["cd apps/api && pip install -r requirements.txt"]
+
+[start]
+cmd = "cd apps/api && python railway_start.py" 

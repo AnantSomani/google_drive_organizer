@@ -1,0 +1,1 @@
+web: cd apps/api && python railway_start.py 
