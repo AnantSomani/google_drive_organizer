@@ -25,8 +25,8 @@ class AIService:
         # Add folders
         for folder in folders:
             file_data.append({
-                "id": folder.get("id"),
-                "name": folder.get("name", "Unknown"),
+                "id": folder.get("id", ""),
+                "name": str(folder.get("name", "Unknown")).replace('"', "'").replace('\n', ' ').replace('\r', ' '),
                 "type": "folder",
                 "parent": folder.get("parents", [""])[0] if folder.get("parents") else "root"
             })
@@ -34,14 +34,19 @@ class AIService:
         # Add files
         for file in files:
             file_data.append({
-                "id": file.get("id"),
-                "name": file.get("name", "Unknown"),
+                "id": file.get("id", ""),
+                "name": str(file.get("name", "Unknown")).replace('"', "'").replace('\n', ' ').replace('\r', ' '),
                 "type": "file",
-                "mime_type": file.get("mimeType", ""),
+                "mime_type": str(file.get("mimeType", "")).replace('"', "'"),
                 "parent": file.get("parents", [""])[0] if file.get("parents") else "root"
             })
         
-        return json.dumps(file_data, indent=2)
+        try:
+            return json.dumps(file_data, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"Failed to serialize file data: {e}")
+            # Fallback to a simpler format
+            return json.dumps([{"name": "Error processing files", "type": "error"}], indent=2)
     
     def _create_analysis_prompt(self, file_data: str) -> str:
         """Create the LLM prompt for drive analysis"""
@@ -83,9 +88,11 @@ Focus on creating a logical, intuitive structure that would help someone find fi
         """Generate AI proposal for drive organization"""
         try:
             logger.info(f"Starting AI analysis for scan {scan_id}")
+            logger.info(f"Processing {len(files)} files and {len(folders)} folders")
             
             # Prepare data for LLM
             file_data = self._prepare_file_data(files, folders)
+            logger.info(f"Prepared file data length: {len(file_data)}")
             prompt = self._create_analysis_prompt(file_data)
             
             # Call OpenAI

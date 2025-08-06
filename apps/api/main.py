@@ -2,7 +2,7 @@
 
 import os
 import uuid
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -19,6 +19,19 @@ from drive_client import build_service, list_files, move_item, create_folder, Dr
 from classification import propose_structure, summarize_large_file_list
 
 # Configure logging
+import logging
+import sys
+
+# Set up file logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('api.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
 structlog.configure(
     processors=[
         structlog.stdlib.filter_by_level,
@@ -38,6 +51,34 @@ structlog.configure(
 )
 
 logger = structlog.get_logger(__name__)
+
+def validate_scan_data(files: List[Dict], folders: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    """Validate and sanitize scan data before AI processing"""
+    validated_files = []
+    validated_folders = []
+    
+    for file in files:
+        if isinstance(file, dict) and 'id' in file and 'name' in file:
+            # Sanitize file data
+            sanitized_file = {
+                'id': str(file.get('id', '')),
+                'name': str(file.get('name', '')).replace('"', "'").replace('\n', ' ').replace('\r', ' '),
+                'mimeType': str(file.get('mimeType', '')),
+                'parents': file.get('parents', [])
+            }
+            validated_files.append(sanitized_file)
+    
+    for folder in folders:
+        if isinstance(folder, dict) and 'id' in folder and 'name' in folder:
+            # Sanitize folder data
+            sanitized_folder = {
+                'id': str(folder.get('id', '')),
+                'name': str(folder.get('name', '')).replace('"', "'").replace('\n', ' ').replace('\r', ' '),
+                'parents': folder.get('parents', [])
+            }
+            validated_folders.append(sanitized_folder)
+    
+    return validated_files, validated_folders
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -918,6 +959,7 @@ async def scan_drive(
     """Initiate a comprehensive scan of the user's Google Drive."""
     try:
         # Create scan record
+        # Generate scan ID
         scan_id = str(uuid.uuid4())
         supabase.table("drive_scans").insert({
             "id": scan_id,
@@ -997,16 +1039,22 @@ async def _scan_drive_task(
         file_count = len(all_files)
         folder_count = len(all_folders)
         
-        # Store file metadata
+        # Store file metadata with cleanup of existing data
         if all_files:
+            # Delete existing files for this scan_id (if any)
+            supabase.table("drive_files").delete().eq("scan_id", scan_id).execute()
+            # Insert new files
             supabase.table("drive_files").insert({
                 "scan_id": scan_id,
                 "user_id": user_id,
                 "files": all_files
             }).execute()
         
-        # Store folder metadata
+        # Store folder metadata with cleanup of existing data
         if all_folders:
+            # Delete existing folders for this scan_id (if any)
+            supabase.table("drive_folders").delete().eq("scan_id", scan_id).execute()
+            # Insert new folders
             supabase.table("drive_folders").insert({
                 "scan_id": scan_id,
                 "user_id": user_id,
@@ -1020,6 +1068,9 @@ async def _scan_drive_task(
             "folder_count": folder_count,
             "completed_at": "now()"
         }).eq("id", scan_id).execute()
+        
+        # Clean up old scans
+        await cleanup_old_scans(user_id, keep_count=5)
         
         logger.info("Completed Drive scan", 
                    user_id=user_id, 
@@ -1367,13 +1418,24 @@ async def analyze_drive_with_ai(
 ):
     """Start AI analysis of drive structure"""
     try:
+        logger.info(f"Starting AI analysis request for scan {scan_id}, user {current_user['id']}")
+        
         if not ai_service:
+            logger.error("AI service not available")
             raise HTTPException(status_code=500, detail="AI service not available")
         
+        logger.info("AI service is available, proceeding with analysis")
+        
         # Check if analysis already exists for this scan
-        existing_response = supabase.table("ai_analyses").select("id, status").eq(
-            "scan_id", scan_id
-        ).eq("user_id", current_user["id"]).execute()
+        try:
+            logger.info("Checking for existing analysis...")
+            existing_response = supabase.table("ai_analyses").select("id, status").eq(
+                "scan_id", scan_id
+            ).eq("user_id", current_user["id"]).execute()
+            logger.info(f"Existing analysis check completed: {len(existing_response.data) if existing_response.data else 0} found")
+        except Exception as e:
+            logger.error(f"Database error checking existing analysis: {e}")
+            raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
         
         if existing_response.data:
             existing_analysis = existing_response.data[0]
@@ -1417,12 +1479,18 @@ async def analyze_drive_with_ai(
             }).execute()
         
         # Start background task
-        background_tasks.add_task(
-            _ai_analysis_task,
-            analysis_id=analysis_id,
-            scan_id=scan_id,
-            user_id=current_user["id"]
-        )
+        try:
+            logger.info(f"Starting background task for analysis {analysis_id}")
+            background_tasks.add_task(
+                _ai_analysis_task,
+                analysis_id=analysis_id,
+                scan_id=scan_id,
+                user_id=current_user["id"]
+            )
+            logger.info("Background task started successfully")
+        except Exception as e:
+            logger.error(f"Failed to start background task: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to start background task: {str(e)}")
         
         return AIAnalysisResponse(
             analysis_id=analysis_id,
@@ -1533,11 +1601,15 @@ async def apply_ai_proposal(
 async def _ai_analysis_task(analysis_id: str, scan_id: str, user_id: str):
     """Background task for AI analysis"""
     try:
+        logger.info(f"Starting AI analysis background task for {analysis_id}")
+        
         # Update status to processing
         supabase.table("ai_analyses").update({
             "status": "processing",
             "progress": 10
         }).eq("id", analysis_id).execute()
+        
+        logger.info("Updated analysis status to processing")
         
         # Get scan data
         scan_response = supabase.table("drive_scans").select("*").eq(
@@ -1550,24 +1622,53 @@ async def _ai_analysis_task(analysis_id: str, scan_id: str, user_id: str):
         scan_data = scan_response.data[0]
         
         # Get files and folders
-        files_response = supabase.table("drive_files").select("*").eq(
-            "scan_id", scan_id
-        ).execute()
-        
-        folders_response = supabase.table("drive_folders").select("*").eq(
-            "scan_id", scan_id
-        ).execute()
-        
-        files = files_response.data[0]["files"] if files_response.data else []
-        folders = folders_response.data[0]["folders"] if folders_response.data else []
+        try:
+            logger.info(f"Retrieving files and folders for scan {scan_id}")
+            files_response = supabase.table("drive_files").select("files").eq(
+                "scan_id", scan_id
+            ).execute()
+            
+            folders_response = supabase.table("drive_folders").select("folders").eq(
+                "scan_id", scan_id
+            ).execute()
+            
+            logger.info(f"Files response: {len(files_response.data) if files_response.data else 0} records")
+            logger.info(f"Folders response: {len(folders_response.data) if folders_response.data else 0} records")
+            
+            files = files_response.data[0]["files"] if files_response.data else []
+            folders = folders_response.data[0]["folders"] if folders_response.data else []
+            
+            logger.info(f"Retrieved {len(files)} files and {len(folders)} folders")
+            
+            # Validate and sanitize data before AI processing
+            logger.info("Validating and sanitizing scan data")
+            validated_files, validated_folders = validate_scan_data(files, folders)
+            
+            logger.info(f"After validation: {len(validated_files)} files and {len(validated_folders)} folders")
+            
+            # Log a sample of the validated data
+            if validated_files:
+                logger.info(f"Sample validated file: {validated_files[0] if len(validated_files) > 0 else 'No files'}")
+            if validated_folders:
+                logger.info(f"Sample validated folder: {validated_folders[0] if len(validated_folders) > 0 else 'No folders'}")
+                
+        except Exception as e:
+            logger.error(f"Failed to retrieve files/folders: {e}")
+            raise Exception(f"Failed to retrieve scan data: {str(e)}")
         
         # Update progress
         supabase.table("ai_analyses").update({
             "progress": 30
         }).eq("id", analysis_id).execute()
         
-        # Generate AI proposal
-        proposal = await ai_service.generate_proposal(scan_id, files, folders)
+        # Generate AI proposal with validated data
+        logger.info(f"Calling AI service with {len(validated_files)} validated files and {len(validated_folders)} validated folders")
+        try:
+            proposal = await ai_service.generate_proposal(scan_id, validated_files, validated_folders)
+            logger.info("AI service call completed successfully")
+        except Exception as e:
+            logger.error(f"AI service call failed: {e}")
+            raise e
         
         # Update progress
         supabase.table("ai_analyses").update({
@@ -1575,13 +1676,19 @@ async def _ai_analysis_task(analysis_id: str, scan_id: str, user_id: str):
         }).eq("id", analysis_id).execute()
         
         # Store proposal
-        supabase.table("ai_proposals").insert({
-            "analysis_id": analysis_id,
-            "scan_id": scan_id,
-            "user_id": user_id,
-            "proposal_data": proposal,
-            "created_at": "now()"
-        }).execute()
+        logger.info("Storing AI proposal in database")
+        try:
+            supabase.table("ai_proposals").insert({
+                "analysis_id": analysis_id,
+                "scan_id": scan_id,
+                "user_id": user_id,
+                "proposal_data": proposal,
+                "created_at": "now()"
+            }).execute()
+            logger.info("AI proposal stored successfully")
+        except Exception as e:
+            logger.error(f"Failed to store AI proposal: {e}")
+            raise e
         
         # Update status to completed
         supabase.table("ai_analyses").update({
@@ -1600,6 +1707,30 @@ async def _ai_analysis_task(analysis_id: str, scan_id: str, user_id: str):
             "status": "error",
             "error_message": str(e)
         }).eq("id", analysis_id).execute()
+
+async def cleanup_old_scans(user_id: str, keep_count: int = 5):
+    """Clean up old scans, keeping only the most recent ones"""
+    try:
+        logger.info(f"Starting cleanup for user {user_id}, keeping {keep_count} scans")
+        
+        # Get old scans to delete
+        old_scans = supabase.table("drive_scans").select("id").eq(
+            "user_id", user_id
+        ).order("created_at", desc=False).limit(100).execute()
+        
+        if len(old_scans.data) > keep_count:
+            scans_to_delete = old_scans.data[:-keep_count]
+            scan_ids = [scan['id'] for scan in scans_to_delete]
+            
+            # Delete related data (CASCADE will handle this)
+            supabase.table("drive_scans").delete().in_("id", scan_ids).execute()
+            
+            logger.info(f"Cleaned up {len(scan_ids)} old scans for user {user_id}")
+        else:
+            logger.info(f"No cleanup needed for user {user_id}, only {len(old_scans.data)} scans found")
+            
+    except Exception as e:
+        logger.error(f"Cleanup failed for user {user_id}: {e}")
 
 async def _apply_ai_proposal(service, proposal_data: Dict) -> Dict:
     """Apply AI proposal to Google Drive"""
