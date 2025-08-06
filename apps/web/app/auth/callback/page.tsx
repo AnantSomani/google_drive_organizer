@@ -32,7 +32,7 @@ export default function AuthCallbackPage() {
           if (data.session.provider_token && data.session.provider_refresh_token) {
             console.log('Attempting to store Google tokens...')
             try {
-              const response = await fetch('http://localhost:3030/api/google/store-token', {
+              const response = await fetch('/api/google/store-token', {
                 method: 'POST',
                 headers: { 
                   'Content-Type': 'application/json',

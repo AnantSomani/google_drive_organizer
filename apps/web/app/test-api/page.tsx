@@ -33,7 +33,7 @@ export default function TestApiPage() {
     setLoading(true)
     setError('')
     try {
-      const response = await fetch('http://localhost:3030/api/drive/files', {
+      const response = await fetch('/api/drive/files', {
         headers: {
           'Authorization': `Bearer ${accessToken}`,
           'Content-Type': 'application/json'
@@ -64,7 +64,7 @@ export default function TestApiPage() {
     setLoading(true)
     setError('')
     try {
-      const response = await fetch('http://localhost:3030/api/drive/folders', {
+      const response = await fetch('/api/drive/folders', {
         headers: {
           'Authorization': `Bearer ${accessToken}`,
           'Content-Type': 'application/json'
@@ -95,7 +95,7 @@ export default function TestApiPage() {
     setLoading(true)
     setError('')
     try {
-      const response = await fetch('http://localhost:3030/api/drive/scan', {
+      const response = await fetch('/api/drive/scan', {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${accessToken}`,
