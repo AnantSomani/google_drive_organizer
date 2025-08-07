@@ -9,11 +9,12 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 import structlog
 from supabase import create_client
-import openai
+
 from dotenv import load_dotenv
 
-# Load environment variables from root directory
-load_dotenv("../../.env")
+# Load environment variables from root directory (development only)
+if os.getenv("ENV", "development") != "production":
+    load_dotenv("../../.env")
 
 from drive_client import build_service, list_files, move_item, create_folder, DriveClientError
 from classification import propose_structure, summarize_large_file_list
@@ -130,8 +131,6 @@ except Exception as e:
     logger.error(f"Traceback: {traceback.format_exc()}")
     supabase = None
 
-# Configure OpenAI
-openai.api_key = os.getenv("OPENAI_API_KEY")
 
 # Security
 security = HTTPBearer()
@@ -1247,7 +1246,7 @@ def build_tree_structure(files: List[Dict], folders: List[Dict]) -> TreeNode:
                         item["level"] = parent["level"] + 1
                     else:
                         # Parent not found, treat as root item
-                        logger.warning(f"Parent {parent_id} not found for item {item_id}, treating as root")
+                        logger.debug(f"Parent {parent_id} not found for item {item_id}, treating as root")
                         root_items.append(item)
                         break
         
