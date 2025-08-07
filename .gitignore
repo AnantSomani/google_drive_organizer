@@ -128,3 +128,4 @@ Thumbs.db
 
 # Vercel
 .vercel/ apps/api/api.log
+apps/web/.vercel/
