@@ -127,4 +127,4 @@ Thumbs.db
 .railway/
 
 # Vercel
-.vercel/ 
+.vercel/ apps/api/api.log
