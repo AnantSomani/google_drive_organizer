@@ -60,22 +60,29 @@ def validate_scan_data(files: List[Dict], folders: List[Dict]) -> Tuple[List[Dic
     
     for file in files:
         if isinstance(file, dict) and 'id' in file and 'name' in file:
-            # Sanitize file data
+            # Preserve richer Drive metadata for better AI context
             sanitized_file = {
                 'id': str(file.get('id', '')),
                 'name': str(file.get('name', '')).replace('"', "'").replace('\n', ' ').replace('\r', ' '),
                 'mimeType': str(file.get('mimeType', '')),
-                'parents': file.get('parents', [])
+                'parents': file.get('parents', []),
+                'createdTime': file.get('createdTime'),
+                'modifiedTime': file.get('modifiedTime'),
+                'size': file.get('size'),
+                'webViewLink': file.get('webViewLink'),
             }
             validated_files.append(sanitized_file)
     
     for folder in folders:
         if isinstance(folder, dict) and 'id' in folder and 'name' in folder:
-            # Sanitize folder data
+            # Preserve core metadata for folders too
             sanitized_folder = {
                 'id': str(folder.get('id', '')),
                 'name': str(folder.get('name', '')).replace('"', "'").replace('\n', ' ').replace('\r', ' '),
-                'parents': folder.get('parents', [])
+                'parents': folder.get('parents', []),
+                'createdTime': folder.get('createdTime'),
+                'modifiedTime': folder.get('modifiedTime'),
+                'webViewLink': folder.get('webViewLink'),
             }
             validated_folders.append(sanitized_folder)
     
@@ -1753,17 +1760,47 @@ async def _apply_ai_proposal(service, proposal_data: Dict) -> Dict:
             except Exception as e:
                 logger.error(f"Failed to create folder {folder['name']}: {str(e)}")
         
+        # Optional: handle merges of duplicate folders before moving files
+        async def _list_children_files(parent_id: str) -> List[Dict]:
+            try:
+                query = f"'{parent_id}' in parents and trashed=false"
+                resp = service.files().list(q=query, fields="files(id)").execute()
+                return resp.get('files', [])
+            except Exception as e:
+                logger.error(f"Failed to list children for folder {parent_id}: {str(e)}")
+                return []
+
+        for merge in proposal_data.get("merges", []):
+            try:
+                to_folder_id = merge.get("to_folder_id")
+                from_ids = merge.get("from_folder_ids", [])
+                if not to_folder_id or not from_ids:
+                    continue
+                for src_id in from_ids:
+                    children = await _list_children_files(src_id)
+                    for child in children:
+                        try:
+                            await move_item(service, child['id'], to_folder_id)
+                            results["successful_moves"].append(child['id'])
+                        except Exception as e:
+                            results["failed_moves"].append({"file_id": child['id'], "error": str(e)})
+            except Exception as e:
+                logger.error(f"Merge operation failed: {str(e)}")
+        
         # Move files
         for move in proposal_data["file_moves"]:
             try:
-                target_folder_id = folder_map.get(move["proposed_folder"])
+                # Prefer explicit target folder IDs from proposal when available
+                target_folder_id = move.get("target_folder_id")
+                if not target_folder_id:
+                    target_folder_id = folder_map.get(move.get("proposed_folder"))
                 if target_folder_id:
                     await move_item(service, move["file_id"], target_folder_id)
                     results["successful_moves"].append(move["file_id"])
                 else:
                     results["failed_moves"].append({
                         "file_id": move["file_id"],
-                        "error": f"Target folder '{move['proposed_folder']}' not found"
+                        "error": f"Target folder not resolved for move"
                     })
             except Exception as e:
                 results["failed_moves"].append({
