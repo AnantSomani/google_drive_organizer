@@ -601,6 +601,15 @@ export default function ScanResultsPage() {
               setAiAnalysisStatus(null)
             }}
             loading={loadingAI}
+            folderIdToName={(() => {
+              const map: Record<string, string> = {}
+              try {
+                for (const f of scanData?.folders || []) {
+                  if (f?.id) map[f.id] = f.name || 'Unnamed Folder'
+                }
+              } catch {}
+              return map
+            })()}
           />
         )}
 
