@@ -64,7 +64,8 @@ export default function ScanResultsPage() {
   const [aiProposal, setAiProposal] = useState<any>(null)
   const [showAIProposal, setShowAIProposal] = useState(false)
   const [loadingAI, setLoadingAI] = useState(false)
-
+  const [isScanning, setIsScanning] = useState(false)
+ 
   useEffect(() => {
     if (!loading && !user) {
       router.push('/login')
@@ -119,6 +120,7 @@ export default function ScanResultsPage() {
 
   const handleRescan = async () => {
     try {
+      setIsScanning(true)
       setLoadingData(true)
       setError(null)
       
@@ -142,70 +144,77 @@ export default function ScanResultsPage() {
           max_results: 1000
         })
       })
-
+  
       if (!response.ok) {
         throw new Error(`Failed to start scan: ${response.statusText}`)
       }
-
+  
       const data = await response.json()
       
-      // Poll for scan completion
+      // Poll for scan completion and wait until done
       await pollScanStatus(data.scan_id)
     } catch (err) {
       console.error('Error starting scan:', err)
       setError(err instanceof Error ? err.message : 'Failed to start scan')
       setLoadingData(false)
+    } finally {
+      setIsScanning(false)
     }
   }
 
-  const pollScanStatus = async (scanId: string) => {
+  const pollScanStatus = (scanId: string) => {
     const maxAttempts = 60 // 5 minutes with 5-second intervals
     let attempts = 0
 
-    const poll = async () => {
-      try {
-        // Get the Supabase session token for authentication
-        const { data: { session } } = await supabase.auth.getSession()
-        const sessionToken = session?.access_token
-        
-        if (!sessionToken) {
-          throw new Error('No session token available')
-        }
-        
-        const response = await fetch(`/api/drive/scan/status/${scanId}`, {
-          headers: {
-            'Authorization': `Bearer ${sessionToken}`,
-            'Content-Type': 'application/json'
+    return new Promise<void>((resolve, reject) => {
+      const poll = async () => {
+        try {
+          // Get the Supabase session token for authentication
+          const { data: { session } } = await supabase.auth.getSession()
+          const sessionToken = session?.access_token
+          
+          if (!sessionToken) {
+            throw new Error('No session token available')
           }
-        })
+          
+          const response = await fetch(`/api/drive/scan/status/${scanId}`, {
+            headers: {
+              'Authorization': `Bearer ${sessionToken}`,
+              'Content-Type': 'application/json'
+            }
+          })
 
-        if (!response.ok) {
-          throw new Error(`Failed to check scan status: ${response.statusText}`)
-        }
+          if (!response.ok) {
+            throw new Error(`Failed to check scan status: ${response.statusText}`)
+          }
 
-        const data = await response.json()
-        
-        if (data.status === 'completed') {
-          await fetchLatestScanResults()
-          return
-        } else if (data.status === 'error') {
-          throw new Error(data.error_message || 'Scan failed')
-        }
+          const data = await response.json()
+          
+          if (data.status === 'completed') {
+            await fetchLatestScanResults()
+            resolve()
+            return
+          } else if (data.status === 'error') {
+            reject(new Error(data.error_message || 'Scan failed'))
+            return
+          }
 
-        attempts++
-        if (attempts < maxAttempts) {
-          setTimeout(poll, 5000) // Poll every 5 seconds
-        } else {
-          throw new Error('Scan timed out')
+          attempts++
+          if (attempts < maxAttempts) {
+            setTimeout(poll, 5000) // Poll every 5 seconds
+          } else {
+            reject(new Error('Scan timed out'))
+          }
+        } catch (err: any) {
+          console.error('Error polling scan status:', err)
+          setError(err instanceof Error ? err.message : 'Failed to check scan status')
+          setLoadingData(false)
+          reject(err)
         }
-      } catch (err) {
-        console.error('Error polling scan status:', err)
-        setError(err instanceof Error ? err.message : 'Failed to check scan status')
-        setLoadingData(false)
       }
-    }
 
-    poll()
+      poll()
+    })
   }
 
   const formatDate = (dateString: string) => {
@@ -430,11 +439,11 @@ export default function ScanResultsPage() {
             <div className="flex flex-col sm:flex-row gap-3 mt-4 lg:mt-0">
               <button 
                 onClick={handleRescan}
-                disabled={loadingData}
+                disabled={isScanning || loadingAI}
                 className="btn btn-secondary flex items-center gap-2 disabled:opacity-50"
               >
-                <RefreshCw className={`w-4 h-4 ${loadingData ? 'animate-spin' : ''}`} />
-                {loadingData ? 'Scanning...' : 'Rescan Drive'}
+                <RefreshCw className={`w-4 h-4 ${isScanning ? 'animate-spin' : ''}`} />
+                {isScanning ? 'Scanning...' : 'Rescan Drive'}
               </button>
               <button 
                 onClick={handleAIOrganization}
